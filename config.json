@@ -1,7 +1,7 @@
 {
   "server": {
-    "port": 7848,
-    "host": "0.0.0.0"
+    "port": 8080,
+    "host": "127.0.0.1"
   },
   "upstream": {
     "url": "https://integrate.api.nvidia.com/v1",

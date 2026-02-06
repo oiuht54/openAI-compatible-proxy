@@ -1,7 +1,7 @@
 {
   "name": "openai-proxy-middleware",
-  "version": "1.0.0",
-  "description": "Enterprise-grade OpenAI compatible proxy for parameter injection",
+  "version": "2.0.0",
+  "description": "Enterprise-grade OpenAI compatible proxy for parameter injection with monitoring",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
@@ -14,5 +14,8 @@
     "pino": "^8.16.0",
     "pino-pretty": "^10.2.0",
     "zod": "^3.22.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

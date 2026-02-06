@@ -1,43 +1,222 @@
+// @ts-check
 import axios from 'axios';
+import http from 'http';
+import https from 'https';
 import { PassThrough } from 'stream';
 import { LoggerService } from '../utils/Logger.js';
 import { configManager } from '../config/ConfigManager.js';
+import { metricsService } from './MetricsService.js';
+
+/**
+ * Circuit Breaker для защиты от cascading failures
+ */
+class CircuitBreaker {
+  constructor(threshold = 5, timeout = 60000) {
+    this.failureCount = 0;
+    this.failureThreshold = threshold;
+    this.timeout = timeout;
+    this.lastAttemptTime = Date.now();
+    this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+    this.nextAttemptTime = 0;
+  }
+
+  /**
+   * @param {() => Promise<any>} fn
+   * @returns {Promise<any>}
+   */
+  async execute(fn) {
+    if (this.state === 'OPEN' && Date.now() < this.nextAttemptTime) {
+      throw new Error('Circuit Breaker is OPEN requests are temporarily blocked');
+    }
+
+    if (this.state === 'OPEN' && Date.now() >= this.nextAttemptTime) {
+      this.state = 'HALF_OPEN';
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0;
+    this.state = 'CLOSED';
+  }
+
+  onFailure() {
+    this.failureCount++;
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'OPEN';
+      this.nextAttemptTime = Date.now() + this.timeout;
+      LoggerService.warn(`Circuit Breaker OPENED. ${this.failureCount} failures. Next attempt in ${this.timeout}ms`);
+    }
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      nextAttemptTime: this.state === 'OPEN' ? this.nextAttemptTime - Date.now() : 0,
+    };
+  }
+}
+
+// Глобальный circuit breaker для upstream
+const circuitBreaker = new CircuitBreaker(5, 60000);
+
+/**
+ * Утилита для retry запросов с экспоненциальным backoff
+ * @param {() => Promise<any>} fn
+ * @param {number} maxRetries
+ * @param {number} baseDelay
+ * @returns {Promise<any>}
+ */
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+  let lastError;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      // Не retry для клиентских ошибок (4xx) и некоторых специфических ошибок
+      const err = /** @type {any} */ (error);
+      if (err.response && typeof err.response.status === 'number' && 
+          err.response.status >= 400 && err.response.status < 500) {
+        throw error;
+      }
+      
+      if (attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 500;
+        LoggerService.warn(`Request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms...`, {
+          error: err.message,
+        });
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+/**
+ * Фильтрация чувствительных заголовков для логирования
+ * @param {Record<string, string>} headers
+ * @returns {Record<string, string>}
+ */
+function filterSensitiveHeaders(headers) {
+  const sensitiveHeaders = ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-auth-token'];
+  const filtered = /** @type {Record<string, string>} */ ({});
+  
+  for (const [key, value] of Object.entries(headers)) {
+    const lowerKey = key.toLowerCase();
+    if (sensitiveHeaders.includes(lowerKey)) {
+      filtered[key] = '[REDACTED]';
+    } else {
+      filtered[key] = value;
+    }
+  }
+  
+  return filtered;
+}
 
 export class ProxyService {
-  static activeControllers = new Set();
+  /** @type {Map<AbortController, () => void>} */
+  static activeControllers = new Map();
 
   static cancelAllRequests() {
     LoggerService.warn(`Force killing ${this.activeControllers.size} active requests...`);
-    for (const controller of this.activeControllers) {
+    for (const [controller] of this.activeControllers) {
       controller.abort('Server Shutdown');
     }
     this.activeControllers.clear();
   }
 
+  static getCircuitBreakerStatus() {
+    return circuitBreaker.getStatus();
+  }
+
+  static getCircuitBreaker() {
+    return circuitBreaker;
+  }
+
   constructor() {
     this.client = axios.create({
-      timeout: 0, 
+      timeout: 0,
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: 30000,
+      }),
+      httpsAgent: new https.Agent({
+        keepAlive: true,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: 30000,
+        rejectUnauthorized: true,
+      }),
       validateStatus: () => true,
     });
   }
 
+  /**
+   * @param {string} endpoint
+   * @param {string} method
+   * @param {Record<string, string>} headers
+   * @param {any} body
+   * @param {import('express').Response} res
+   */
   async forwardRequest(endpoint, method, headers, body, res) {
     const currentConfig = configManager.get();
     const upstreamConfig = currentConfig.upstream;
     const currentTimeoutMs = upstreamConfig.timeoutMs;
 
     const abortController = new AbortController();
-    ProxyService.activeControllers.add(abortController);
+    let cleanedUp = false;
+    
+    // Флаги для отслеживания активных обработчиков
+    /** @type {Array<{emitter: import('events').EventEmitter, event: string, handler: (...args: any[]) => void}>} */
+    const eventHandlers = [];
+
+    // Функция для безопасной очистки ресурсов
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      
+      clearTimeout(timeoutId);
+      ProxyService.activeControllers.delete(abortController);
+      
+      // Удаляем все зарегистрированные обработчики событий
+      eventHandlers.forEach(({ emitter, event, handler }) => {
+        emitter.off(event, handler);
+      });
+      eventHandlers.length = 0;
+    };
+
+    /**
+     * @param {import('events').EventEmitter} emitter
+     * @param {string} event
+     * @param {(...args: any[]) => void} handler
+     */
+    const registerHandler = (emitter, event, handler) => {
+      eventHandlers.push({ emitter, event, handler });
+      emitter.on(event, handler);
+    };
+
+    ProxyService.activeControllers.set(abortController, cleanup);
 
     const timeoutId = setTimeout(() => {
       LoggerService.warn(`Request timed out after ${currentTimeoutMs}ms. Aborting...`);
       abortController.abort('Request Timeout');
+      cleanup();
     }, currentTimeoutMs);
-
-    const cleanup = () => {
-      clearTimeout(timeoutId);
-      ProxyService.activeControllers.delete(abortController);
-    };
 
     const baseUrl = upstreamConfig.url.replace(/\/$/, "");
     const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
@@ -45,6 +224,7 @@ export class ProxyService {
     
     const forwardHeaders = { ...headers };
     
+    // Удаляем заголовки которые нужно фильтровать
     delete forwardHeaders['host'];
     delete forwardHeaders['content-length'];
     delete forwardHeaders['connection'];
@@ -54,22 +234,36 @@ export class ProxyService {
       forwardHeaders['authorization'] = `Bearer ${upstreamConfig.apiKey}`;
     }
 
-    LoggerService.logTraffic('req', `${method} ${targetUrl}`, body);
+    // Логируем с фильтрованными заголовками
+    LoggerService.logTraffic('req', `${method} ${targetUrl}`, {
+      headers: filterSensitiveHeaders(forwardHeaders),
+      body: body,
+    });
 
-    const isStreaming = body.stream === true;
+    const isStreaming = body?.stream === true;
+    const requestStartTime = Date.now();
+
+    // Регистрация начала запроса в метриках
+    const requestId = metricsService.startRequest(method, targetUrl, forwardHeaders, body);
 
     try {
-      const response = await this.client({
-        method: method,
-        url: targetUrl,
-        headers: forwardHeaders,
-        data: body,
-        responseType: isStreaming ? 'stream' : 'json',
-        signal: abortController.signal,
-      });
+      // Выполняем запрос через circuit breaker и с retry
+      const response = await retryWithBackoff(async () => {
+        return await circuitBreaker.execute(async () => {
+          return await this.client({
+            method: method,
+            url: targetUrl,
+            headers: forwardHeaders,
+            data: body,
+            responseType: isStreaming ? 'stream' : 'json',
+            signal: abortController.signal,
+          });
+        });
+      }, 3, 1000);
 
       res.status(response.status);
 
+      // Пересылаем заголовки от upstream
       Object.entries(response.headers).forEach(([key, value]) => {
         const lowerKey = key.toLowerCase();
         if (!['transfer-encoding', 'connection', 'content-length', 'content-encoding'].includes(lowerKey)) {
@@ -86,78 +280,116 @@ export class ProxyService {
 
         const spyStream = new PassThrough();
         let accumulatedText = '';
-        let accumulatedThinking = ''; // Добавили буфер для мыслей
+        let accumulatedThinking = '';
 
-        spyStream.on('data', (chunk) => {
+        // Регистрируем обработчик для накопления данных
+        registerHandler(spyStream, 'data', (chunk) => {
           const lines = chunk.toString().split('\n');
           for (const line of lines) {
             if (line.trim().startsWith('data: ')) {
               try {
                 const jsonStr = line.trim().substring(6);
                 if (jsonStr === '[DONE]') continue;
-                
+                 
                 const data = JSON.parse(jsonStr);
                 const delta = data.choices?.[0]?.delta;
 
                 if (delta) {
-                    // 1. Ловим основной контент
-                    if (delta.content) {
-                        accumulatedText += delta.content;
-                    }
-                    // 2. Ловим мысли (Chain of Thought)
-                    // Разные провайдеры используют разные поля, проверяем основные
-                    const reasoning = delta.reasoning_content || delta.reasoning;
-                    if (reasoning) {
-                        accumulatedThinking += reasoning;
-                    }
+                  if (delta.content) {
+                    accumulatedText += delta.content;
+                  }
+                  const reasoning = delta.reasoning_content || delta.reasoning;
+                  if (reasoning) {
+                    accumulatedThinking += reasoning;
+                  }
                 }
               } catch (e) { }
             }
           }
         });
 
-        spyStream.on('end', () => {
-          cleanup(); 
-          // Выводим полный отчет с мыслями и ответом
-          LoggerService.logTraffic('res', 'STREAM FINISHED (Full Log)', { 
-              thoughts: accumulatedThinking || undefined, // undefined чтобы поле не выводилось если мыслей нет
-              response: accumulatedText 
+        // Обработчик завершения потока
+        registerHandler(spyStream, 'end', () => {
+          const duration = Date.now() - requestStartTime;
+          cleanup();
+          LoggerService.logTraffic('res', 'STREAM FINISHED', {
+            thoughts: accumulatedThinking || undefined,
+            response: accumulatedText,
           });
+          // Регистрация успешного запроса в метриках
+          metricsService.finishRequestSuccess(requestId, response?.status || 200, {
+            thoughts: accumulatedThinking || undefined,
+            response: accumulatedText,
+          }, duration);
         });
 
-        res.on('close', () => {
+        // Обработчик ошибок в потоке данных
+        registerHandler(spyStream, 'error', (err) => {
+          LoggerService.error('SpyStream error', err);
+          cleanup();
+        });
+
+        // Обработчик закрытия соединения клиентом
+        registerHandler(res, 'close', () => {
           if (!res.writableEnded) {
-             LoggerService.warn('Client closed connection. Destroying upstream stream.');
-             abortController.abort('Client Disconnect'); 
+            LoggerService.warn('Client closed connection. Destroying upstream stream.');
+            abortController.abort('Client Disconnect');
+            // Регистрация ошибки метрик при дисконнекте клиента
+            const duration = Date.now() - requestStartTime;
+            metricsService.finishRequestError(requestId, new Error('Client disconnected'), duration, 'client_disconnect');
           }
+          cleanup();
+        });
+
+        // Обработчик ошибок в upstream потоке
+        registerHandler(response.data, 'error', (err) => {
+          LoggerService.error('Upstream stream error', err);
+          const duration = Date.now() - requestStartTime;
+          metricsService.finishRequestError(requestId, err, duration, 'upstream_stream_error');
           cleanup();
         });
 
         response.data.pipe(spyStream).pipe(res);
 
-        response.data.on('error', (err) => {
-             LoggerService.error('Stream Data Error', err);
-             cleanup();
-        });
-
       } else {
+        // Обработка не-стриминговых ответов
         const jsonData = response.data;
         cleanup();
-        LoggerService.logTraffic('res', `JSON RESPONSE (${response.status})`, jsonData);
+        const duration = Date.now() - requestStartTime;
+        
+        // Регистрация в метриках
+        if (response.status >= 400) {
+          LoggerService.logTraffic('res', `ERROR RESPONSE (${response.status})`, {
+            status: response.status,
+            error: jsonData.error || jsonData,
+          });
+          metricsService.finishRequestError(requestId, new Error(`HTTP ${response.status}`), duration, 'http_error');
+        } else {
+          LoggerService.logTraffic('res', `JSON RESPONSE (${response.status})`, jsonData);
+          metricsService.finishRequestSuccess(requestId, response.status, jsonData, duration);
+        }
+        
         res.json(jsonData);
       }
 
     } catch (error) {
+      const duration = Date.now() - requestStartTime;
       cleanup();
 
-      if (axios.isCancel(error) || error.name === 'AbortError' || error.message === 'Request Timeout') {
-        LoggerService.error(`Request aborted: ${error.message || 'Timeout'}`);
+      /** @type {Error} */
+      const typedError = error instanceof Error ? error : new Error(String(error));
+
+      if (axios.isCancel(typedError) || typedError?.name === 'AbortError' || typedError?.message === 'Request Timeout') {
+        LoggerService.error(`Request aborted: ${typedError.message || 'Timeout'}`);
+        metricsService.finishRequestError(requestId, typedError, duration, 'timeout');
         
         const timeoutResponse = {
           error: {
-            message: 'Request timed out waiting for upstream model',
-            type: 'timeout_error',
-            code: 504
+            message: typedError.message === 'Request Timeout' 
+              ? 'Request timed out waiting for upstream model'
+              : typedError.message,
+            type: typedError.message === 'Request Timeout' ? 'timeout_error' : 'request_aborted',
+            code: 504,
           }
         };
         
@@ -167,13 +399,32 @@ export class ProxyService {
         return;
       }
 
-      LoggerService.error('Fatal proxy error', error);
+      if (typedError.message && typedError.message.includes('Circuit Breaker')) {
+        LoggerService.error('Circuit Breaker blocked request', null);
+        metricsService.finishRequestError(requestId, typedError, duration, 'circuit_breaker');
+        
+        const cbResponse = {
+          error: {
+            message: 'Service temporarily unavailable due to repeated failures',
+            type: 'service_unavailable',
+            code: 503,
+          }
+        };
+        
+        if (!res.headersSent) {
+          res.status(503).json(cbResponse);
+        }
+        return;
+      }
+
+      LoggerService.error('Fatal proxy error', null);
+      metricsService.finishRequestError(requestId, typedError, duration, 'proxy_error');
       
       const errorResponse = {
         error: {
           message: 'Bad Gateway: Proxy connection failed',
           type: 'proxy_error',
-          details: error.message
+          details: typedError.message,
         }
       };
 

@@ -1,7 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { LoggerService } from '../utils/Logger.js';
+
+// Для определения пути к файлу в ESM
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Схема валидации
 const ConfigSchema = z.object({
@@ -29,7 +33,22 @@ const ConfigSchema = z.object({
 class ConfigManager {
     constructor() {
         this.config = null;
-        this.configPath = path.resolve(process.cwd(), 'config.json');
+        // Путь к config.json - ищем сначала в root, затем в src/
+        const possiblePaths = [
+            path.resolve(process.cwd(), 'config.json'),
+            path.resolve(process.cwd(), 'src', 'config.json'),
+            path.resolve(__dirname, '..', '..', 'config.json'),
+            path.resolve(__dirname, '..', 'config.json'),
+        ];
+        for (const p of possiblePaths) {
+            if (fs.existsSync(p)) {
+                this.configPath = p;
+                break;
+            }
+        }
+        if (!this.configPath) {
+            this.configPath = possiblePaths[3]; // Fallback: src/config.json
+        }
         this.isReloading = false;
     }
 
