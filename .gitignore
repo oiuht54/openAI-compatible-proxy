@@ -27,6 +27,7 @@ npm-debug.log*
 *.swo
 *~
 config.json
+screenshots
 
 # OS
 .DS_Store
