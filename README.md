@@ -32,8 +32,8 @@ This middleware acts as a bridge between your AI clients (like Chat WebUIs, IDE 
 1.  **Prerequisites:** Node.js >= 18.0.0.
 2.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/openai-proxy-middleware.git
-    cd openai-proxy-middleware
+    git clone https://github.com/oiuht54/openAI-compatible-proxy.git
+    cd openAI-compatible-proxy
     ```
 3.  **Install dependencies:**
     ```bash
@@ -129,8 +129,8 @@ Here you can:
 1.  **Требования:** Node.js версии 18.0.0 или выше.
 2.  **Клонирование репозитория:**
     ```bash
-    git clone https://github.com/your-username/openai-proxy-middleware.git
-    cd openai-proxy-middleware
+    git clone https://github.com/oiuht54/openAI-compatible-proxy.git
+    cd openAI-compatible-proxy
     ```
 3.  **Установка зависимостей:**
     ```bash
