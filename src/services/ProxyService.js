@@ -271,8 +271,8 @@ export class ProxyService {
     firstTokenRetryAttempts,
     requestId,
   }) {
-    /** @type {Error|null} */
-    let lastError;
+    /** @type {Error} */
+    let lastError = new FirstTokenTimeoutError('First token timeout', 0);
 
     for (let attempt = 0; attempt <= firstTokenRetryAttempts; attempt++) {
       const attemptController = attempt === 0 ? abortController : new AbortController();
@@ -558,18 +558,10 @@ export class ProxyService {
         });
 
         // Подключаем heartbeat если включен
-        const streamHeartbeatConfig = currentConfig.upstream.streamHeartbeatEnabled
-          ? {
-              enabled: currentConfig.upstream.streamHeartbeatEnabled,
-              intervalMs: currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000,
-              message: currentConfig.upstream.streamHeartbeatMessage ?? ':keep-alive',
-            }
-          : { enabled: false };
-
-        if (streamHeartbeatConfig.enabled) {
+        if (currentConfig.upstream.streamHeartbeatEnabled) {
           const heartbeatStream = new HeartbeatStream({
-            intervalMs: streamHeartbeatConfig.intervalMs,
-            heartbeatMessage: streamHeartbeatConfig.message,
+            intervalMs: currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000,
+            heartbeatMessage: currentConfig.upstream.streamHeartbeatMessage ?? ':keep-alive',
           });
           
           registerHandler(heartbeatStream, 'error', (err) => {
@@ -579,7 +571,7 @@ export class ProxyService {
           
           response.data.pipe(heartbeatStream).pipe(spyStream).pipe(res);
           
-          LoggerService.info(`Heartbeat enabled (${streamHeartbeatConfig.intervalMs}ms interval)`);
+          LoggerService.info(`Heartbeat enabled (${currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000}ms interval)`);
         } else {
           response.data.pipe(spyStream).pipe(res);
         }
