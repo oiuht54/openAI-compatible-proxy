@@ -27,11 +27,10 @@ class RequestStore {
     this.store = [];
     this.maxSize = maxSize;
     this.index = new Map(); // Для быстрого поиска по ID
-    this.nextId = 1;
   }
 
   add(request) {
-    const id = String(this.nextId++);
+    const id = crypto.randomUUID();
     const entry = { ...request, id, timestamp: new Date().toISOString() };
     
     // Добавление в начало массива (новые первыми)
@@ -86,7 +85,6 @@ class RequestStore {
   clear() {
     this.store = [];
     this.index.clear();
-    this.nextId = 1;
   }
 
   getStats() {
