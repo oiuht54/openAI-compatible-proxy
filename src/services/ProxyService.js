@@ -279,10 +279,41 @@ export class ProxyService {
       let firstTokenReceived = false;
       /** @type {NodeJS.Timeout|null} */
       let firstTokenTimeoutId = null;
+      const attemptStartTime = Date.now();
 
       try {
+        // Создаем PassThrough поток для сбора данных до получения первого токена
+        const bufferedStream = new PassThrough();
+        const savedChunks = [];
+        
+        // СОЗДАЕМ ТАЙМЕР ДО отправки запроса!
+        /** @type {((value: null) => void) | null} */
+        let firstTokenResolve = null;
+        
+        const firstTokenPromise = new Promise((resolve) => {
+          firstTokenResolve = resolve;
+          
+          firstTokenTimeoutId = setTimeout(() => {
+            const elapsed = Date.now() - attemptStartTime;
+             
+            if (!firstTokenReceived) {
+              LoggerService.warn(`[FirstTokenTimeout] Timer expired after ${elapsed}ms - aborting request`, {
+                requestId,
+                attempt: attempt + 1,
+                elapsed,
+                timeout: firstTokenTimeoutMs,
+              });
+              // Прерываем запрос через abort signal - это вызовет ошибку в circuitBreaker.execute
+              attemptController.abort('First Token Timeout');
+              // Разрешаем promise (не reject, чтобы не было unhandled rejection)
+              resolve(null);
+            }
+          }, firstTokenTimeoutMs);
+        });
+        
+        // Теперь отправляем запрос с уже запущенным таймером
         const response = await circuitBreaker.execute(async () => {
-          return await this.client({
+          const axiosPromise = this.client({
             method: method,
             url: targetUrl,
             headers: forwardHeaders,
@@ -290,60 +321,123 @@ export class ProxyService {
             responseType: 'stream',
             signal: attemptController.signal,
           });
+          
+          const result = await axiosPromise;
+          return result;
         });
 
         if (!response.data || typeof response.data.pipe !== 'function') {
+          if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
           return response;
         }
 
-        const firstTokenPromise = new Promise((resolve, reject) => {
-          firstTokenTimeoutId = setTimeout(() => {
-            if (!firstTokenReceived) {
-              attemptController.abort('First Token Timeout');
-              reject(new FirstTokenTimeoutError(`No tokens received within ${firstTokenTimeoutMs}ms`, attempt));
-            }
-          }, firstTokenTimeoutMs);
-
-          const checkForFirstToken = (/** @type {Buffer} */ chunk) => {
-            const lines = chunk.toString().split('\n');
-            for (const line of lines) {
-              if (line.trim().startsWith('data: ')) {
-                const jsonStr = line.trim().substring(6);
-                if (jsonStr === '[DONE]') continue;
-                try {
-                  const data = JSON.parse(jsonStr);
-                  const delta = data.choices?.[0]?.delta;
-                  if (delta && (delta.content || delta.reasoning_content || delta.reasoning)) {
-                    firstTokenReceived = true;
-                    if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
-                    resolve(null);
-                    return;
-                  }
-                } catch (e) {
+        // Устанавливаем обработчик для поиска первого токена в потоке
+        const checkForFirstToken = (/** @type {Buffer} */ chunk) => {
+          // Сохраняем чанк для последующей передачи
+          savedChunks.push(chunk);
+          
+          const lines = chunk.toString().split('\n');
+          for (const line of lines) {
+            if (line.trim().startsWith('data: ')) {
+              const jsonStr = line.trim().substring(6);
+              if (jsonStr === '[DONE]') {
+                continue;
+              }
+              try {
+                const data = JSON.parse(jsonStr);
+                const delta = data.choices?.[0]?.delta;
+                if (delta && (delta.content || delta.reasoning_content || delta.reasoning)) {
+                  firstTokenReceived = true;
+                  const elapsed = Date.now() - attemptStartTime;
+                  if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
+                  
+                  LoggerService.info(`[FirstTokenTimeout] First token received after ${elapsed}ms`, {
+                    requestId,
+                    elapsed,
+                    timeout: firstTokenTimeoutMs,
+                  });
+                  
+                  // Удаляем обработчик после нахождения первого токена
+                  response.data.off('data', checkForFirstToken);
+                  // Передаем все сохраненные чанки в bufferedStream
+                  savedChunks.forEach(c => bufferedStream.write(c));
+                  // Разрешаем promise первого токена
+                  if (firstTokenResolve) firstTokenResolve(null);
+                  return;
                 }
+              } catch (e) {
+                // Ignore JSON parse errors for invalid SSE lines
               }
             }
-          };
+          }
+        };
 
-          response.data.on('data', checkForFirstToken);
-          response.data.once('end', () => {
+        response.data.on('data', checkForFirstToken);
+        response.data.once('end', () => {
+          // Передаем все сохраненные чанки если поток закончился
+          savedChunks.forEach(c => bufferedStream.write(c));
+          bufferedStream.end();
+             
+            // Удаляем обработчик при завершении потока
+            response.data.off('data', checkForFirstToken);
             if (!firstTokenReceived && firstTokenTimeoutId) {
               clearTimeout(firstTokenTimeoutId);
             }
           });
-          response.data.once('error', () => {
+          response.data.once('error', (/** @type {Error} */ err) => {
+            // Удаляем обработчик при ошибке
+            response.data.off('data', checkForFirstToken);
             if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
           });
-        });
-
+        
+        // Ждем получения первого токена или истечения таймера
         await firstTokenPromise;
+        
+        // Заменяем response.data на bufferedStream для дальнейшей передачи
+        const originalResponseData = response.data;
+        response.data = bufferedStream;
+        originalResponseData.pipe(bufferedStream);
+        
         return response;
 
       } catch (error) {
         if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
 
+        // Проверяем, была ли ошибка из-за aborted запроса (таймаут первого токена)
+        const isAbortedError = error && (
+          error.code === 'ERR_CANCELED' ||
+          error.code === 'ECONNABORTED' ||
+          error.message?.includes('canceled') ||
+          error.message?.includes('aborted')
+        );
+
+        // Если это aborted ошибка и таймер сработал, создаем FirstTokenTimeoutError для retry
+        if (isAbortedError) {
+          const timeoutError = new FirstTokenTimeoutError(`No tokens received within ${firstTokenTimeoutMs}ms`, attempt);
+          
+          LoggerService.warn(`[FirstTokenTimeout] First token timeout occurred (attempt ${attempt + 1}/${firstTokenRetryAttempts + 1}). Retrying...`, {
+            requestId,
+            attempt: attempt + 1,
+            message: timeoutError.message,
+            originalError: error?.message || error?.code,
+          });
+          
+          lastError = timeoutError;
+          metricsService.finishRequestError(requestId, timeoutError, 0, 'first_token_timeout');
+          
+          if (attempt < firstTokenRetryAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          continue;
+        }
+
+        // Обработка FirstTokenTimeoutError от других источников
         if (error instanceof FirstTokenTimeoutError) {
-          LoggerService.warn(`First token timeout (attempt ${attempt + 1}/${firstTokenRetryAttempts + 1}). Retrying...`);
+          LoggerService.warn(`[FirstTokenTimeout] First token timeout occurred (attempt ${attempt + 1}/${firstTokenRetryAttempts + 1}). Retrying...`, {
+            requestId,
+            attempt: attempt + 1,
+            message: error.message,
+          });
           lastError = error;
           metricsService.finishRequestError(requestId, error, 0, 'first_token_timeout');
           
@@ -357,6 +451,12 @@ export class ProxyService {
       }
     }
 
+    LoggerService.info(`[FirstTokenTimeout] All retry attempts exhausted for request`, {
+      requestId,
+      totalAttempts: firstTokenRetryAttempts + 1,
+      errorMessage: lastError?.message,
+    });
+    
     throw lastError ?? new FirstTokenTimeoutError('First token timeout after all retries');
   }
 
@@ -441,6 +541,14 @@ export class ProxyService {
 
     // Регистрация начала запроса в метриках
     const requestId = metricsService.startRequest(method, targetUrl, forwardHeaders, body);
+    
+    LoggerService.debug(`[Proxy] Stream detection`, {
+      requestId,
+      isStreaming,
+      streamValue: body?.stream,
+      bodyHasStream: 'stream' in (body || {}),
+      bodyKeys: body ? Object.keys(body) : 'body is null/undefined',
+    });
 
     try {
       // Выполняем запрос через circuit breaker и с retry
@@ -569,9 +677,8 @@ export class ProxyService {
             cleanup();
           });
           
-          response.data.pipe(heartbeatStream).pipe(spyStream).pipe(res);
-          
           LoggerService.info(`Heartbeat enabled (${currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000}ms interval)`);
+          response.data.pipe(heartbeatStream).pipe(spyStream).pipe(res);
         } else {
           response.data.pipe(spyStream).pipe(res);
         }

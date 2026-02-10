@@ -13,18 +13,15 @@ const asyncConsoleStream = new Writable({
 
 const logger = pino({
   level: 'info', // Уменьшили уровень логирования для продакшена
-}, pino.multistream([
-  { stream: pino.transport({
-    target: 'pino-pretty',
-    options: {
-      colorize: true,
-      translateTime: 'SYS:standard',
-      ignore: 'pid,hostname',
-      singleLine: false,
-    },
-  }) },
-  { level: 'info', stream: asyncConsoleStream }
-]));
+}, pino.transport({
+  target: 'pino-pretty',
+  options: {
+    colorize: true,
+    translateTime: 'SYS:standard',
+    ignore: 'pid,hostname',
+    singleLine: false,
+  },
+}));
 
 export class LoggerService {
   static info(message, meta = {}) {
