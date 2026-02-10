@@ -23,6 +23,7 @@ This middleware acts as a bridge between your AI clients (like Chat WebUIs, IDE 
 *   **🛡️ Resilience Patterns:**
     *   **Circuit Breaker:** Automatically stops traffic to a failing upstream to prevent cascading failures.
     *   **Retry Mechanism:** Exponential backoff retries for transient network errors.
+    *   **First-Token Timeout Retries:** Transparent retry for streaming requests that don't receive any tokens within the configured timeout. Client sees nothing - only successful retries.
 *   **⚡ Hot Reload:** Modify `config.json` on the fly without restarting the server.
 *   **📝 Logging & Tracing:** Detailed request logging using `pino`, with sensitive data (API Keys) redacted.
 *   **✅ Validation:** Strict request validation using `Zod` to ensure payload integrity before it hits the upstream.
@@ -53,6 +54,8 @@ The application is controlled via `config.json` (or `src/config.json`). The serv
   "upstream": {
     "url": "///",
     "timeoutMs": 180000,
+    "firstTokenTimeoutMs": 20000,
+    "firstTokenRetryAttempts": 2,
     "apiKey": "sk-your-upstream-api-key"
   },
   "injection": {
@@ -74,10 +77,19 @@ The application is controlled via `config.json` (or `src/config.json`). The serv
 | **server** | `port` | The port the proxy listens on (Default: `7848`). |
 | **upstream** | `url` | The base URL of the actual API provider (e.g., NVIDIA, OpenAI). |
 | | `timeoutMs` | Request timeout in milliseconds. |
+| | `firstTokenTimeoutMs` | **(New!)** Time to wait for the first token in streaming mode (Default: `20000`). If no token is received within this time, the request is cancelled and retried transparently. |
+| | `firstTokenRetryAttempts` | **(New!)** Number of retries for first-token timeouts (Default: `2`). |
+| | `streamHeartbeatEnabled` | **(New!)** Enable heartbeat messages to keep SSE connection alive during streaming (Default: `true`). |
+| | `streamHeartbeatIntervalMs` | **(New!)** Heartbeat interval in milliseconds if no data received from upstream (Default: `30000`). |
+| | `streamHeartbeatMessage` | **(New!)** SSE comment message sent as heartbeat (Default: `":keep-alive"`). |
 | | `apiKey` | (Optional) Hardcode the Upstream API key here. If omitted, the proxy forwards the key sent by the client. |
 | **injection** | `forceModel` | If set, overrides the `model` field in the client's request. |
 | | `parameters` | Key-value pairs merged into the request body (e.g., temperature). |
 | | `chatTemplateKwargs`| Special object for "Thinking" models (NVIDIA/vLLM style). |
+
+#### Streaming Heartbeat
+
+When enabled, the proxy monitors the time since the last token received from the upstream. If the interval exceeds `streamHeartbeatIntervalMs`, an SSE comment (`:keep-alive` by default) is sent to keep the connection alive. This prevents client applications from closing the connection due to long pauses between tokens.
 
 ### Usage
 
@@ -121,6 +133,7 @@ Here you can:
 *   **🛡️ Отказоустойчивость:**
     *   **Circuit Breaker:** Блокирует запросы к "упавшему" API, чтобы предотвратить каскадные сбои.
     *   **Smart Retry:** Повторные попытки запросов с экспоненциальной задержкой при сетевых ошибках.
+    *   **First-Token Timeout Retries:** Прозрачный повтор стриминговых запросов, которые не получили ни одного токена за заданное время. Клиент не видит проблем - только успешный ответ.
 *   **⚡ Горячая перезагрузка:** Изменения в `config.json` применяются мгновенно без перезапуска процесса.
 *   **📝 Логирование:** Подробные логи через `pino` с автоматическим скрытием API-ключей.
 
@@ -150,6 +163,8 @@ Here you can:
   "upstream": {
     "url": "///",
     "timeoutMs": 180000,
+    "firstTokenTimeoutMs": 20000,
+    "firstTokenRetryAttempts": 2,
     "apiKey": "sk-ваш-ключ-от-провайдера"
   },
   "injection": {
@@ -171,10 +186,19 @@ Here you can:
 | **server** | `port` | Порт прокси-сервера (По умолчанию: `7848`). |
 | **upstream** | `url` | URL провайдера API (без `/chat/completions`). |
 | | `timeoutMs` | Таймаут ожидания ответа в миллисекундах. |
+| | `firstTokenTimeoutMs` | **(Новое!)** Время ожидания первого токена в стриминговом режиме (По умолчанию: `20000`). Если токен не получен за это время, запрос отменяется и повторяется прозрачно. |
+| | `firstTokenRetryAttempts` | **(Новое!)** Количество повторных попыток при таймауте первого токена (По умолчанию: `2`). |
+| | `streamHeartbeatEnabled` | **(Новое!)** Включить heartbeat сообщения для поддержания SSE соединения при стриминге (По умолчанию: `true`). |
+| | `streamHeartbeatIntervalMs` | **(Новое!)** Интервал heartbeat в миллисекундах, если нет данных от upstream (По умолчанию: `30000`). |
+| | `streamHeartbeatMessage` | **(Новое!)** SSE сообщение комментария, отправляемое как heartbeat (По умолчанию: `":keep-alive"`). |
 | | `apiKey` | (Опционально) Ключ API. Если не указан, прокси перешлет ключ клиента. |
 | **injection** | `forceModel` | Если заполнено, подменяет модель в запросе клиента на указанную. |
 | | `parameters` | Параметры, добавляемые в тело запроса (температура и т.д.). |
 | | `chatTemplateKwargs`| Объект для специфичных настроек (например, для активации Thinking). |
+
+#### Streaming Heartbeat
+
+Когда включен heartbeat, прокси отслеживает время с последнего полученного токена от upstream. Если интервал превышает `streamHeartbeatIntervalMs`, отправляется SSE комментарий (`:keep-alive` по умолчанию) для поддержания соединения активным. Это предотвращает разрыв соединения клиентскими приложениями при длительных паузах между токенами.
 
 ### Использование
 

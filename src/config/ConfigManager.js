@@ -14,9 +14,14 @@ const ConfigSchema = z.object({
         host: z.string().default('0.0.0.0'),
     }),
     upstream: z.object({
-        url: z.string().url(),
-        timeoutMs: z.number().positive().default(60000),
-        apiKey: z.string().optional(),
+      url: z.string().url(),
+      timeoutMs: z.number().positive().default(60000),
+      apiKey: z.string().optional(),
+      firstTokenTimeoutMs: z.number().positive().default(20000),
+      firstTokenRetryAttempts: z.number().nonnegative().default(2),
+      streamHeartbeatEnabled: z.boolean().default(true),
+      streamHeartbeatIntervalMs: z.number().positive().default(30000),
+      streamHeartbeatMessage: z.string().default(':keep-alive'),
     }),
     // Секция инъекций
     injection: z.object({

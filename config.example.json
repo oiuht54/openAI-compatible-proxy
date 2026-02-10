@@ -1,0 +1,27 @@
+{
+  "server": {
+    "port": 7848,
+    "host": "0.0.0.0"
+  },
+  "upstream": {
+    "url": "http://your-llm-server:8000/v1",
+    "timeoutMs": 180000,
+    "firstTokenTimeoutMs": 20000,
+    "firstTokenRetryAttempts": 2,
+    "apiKey": "sk-your-upstream-api-key",
+    "streamHeartbeatEnabled": true,
+    "streamHeartbeatIntervalMs": 30000,
+    "streamHeartbeatMessage": ":keep-alive"
+  },
+  "injection": {
+    "forceModel": "optional-model-override-name",
+    "enableChatTemplateKwargs": true,
+    "parameters": {
+      "temperature": 1,
+      "top_p": 0.98
+    },
+    "chatTemplateKwargs": {
+      "thinking": true
+    }
+  }
+}
