@@ -284,6 +284,7 @@ export class ProxyService {
       try {
         // Создаем PassThrough поток для сбора данных до получения первого токена
         const bufferedStream = new PassThrough();
+        /** @type {Buffer[]} */
         const savedChunks = [];
         
         // СОЗДАЕМ ТАЙМЕР ДО отправки запроса!
@@ -400,15 +401,18 @@ export class ProxyService {
         
         return response;
 
-      } catch (error) {
+      } catch (/** @type {unknown} */ error) {
         if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
 
+        /** @type {{code?: string, message?: string} | null} */
+        const err = error && typeof error === 'object' ? error : null;
+
         // Проверяем, была ли ошибка из-за aborted запроса (таймаут первого токена)
-        const isAbortedError = error && (
-          error.code === 'ERR_CANCELED' ||
-          error.code === 'ECONNABORTED' ||
-          error.message?.includes('canceled') ||
-          error.message?.includes('aborted')
+        const isAbortedError = err && (
+          err.code === 'ERR_CANCELED' ||
+          err.code === 'ECONNABORTED' ||
+          err.message?.includes('canceled') ||
+          err.message?.includes('aborted')
         );
 
         // Если это aborted ошибка и таймер сработал, создаем FirstTokenTimeoutError для retry
@@ -419,7 +423,7 @@ export class ProxyService {
             requestId,
             attempt: attempt + 1,
             message: timeoutError.message,
-            originalError: error?.message || error?.code,
+            originalError: err?.message || err?.code,
           });
           
           lastError = timeoutError;
