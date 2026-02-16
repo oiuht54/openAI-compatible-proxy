@@ -87,6 +87,34 @@ class RequestStore {
     this.index.clear();
   }
 
+  /**
+   * Очистка старых pending запросов
+   * @param {number} maxAgeMs - максимальный возраст запроса в миллисекундах
+   * @returns {number} количество удаленных запросов
+   */
+  cleanupPendingRequests(maxAgeMs = 300000) {
+    const now = Date.now();
+    let removedCount = 0;
+    
+    for (let i = this.store.length - 1; i >= 0; i--) {
+      const req = this.store[i];
+      
+      if (req.status === 'pending') {
+        const reqTime = new Date(req.timestamp).getTime();
+        const age = now - reqTime;
+        
+        if (age > maxAgeMs) {
+          // Удаляем запрос
+          this.store.splice(i, 1);
+          this.index.delete(req.id);
+          removedCount++;
+        }
+      }
+    }
+    
+    return removedCount;
+  }
+
   getStats() {
     const total = this.store.length;
     const byStatus = {};
@@ -131,6 +159,25 @@ export class MetricsService {
     // Статистика по времени
     this.startTime = Date.now();
     this.lastActiveTime = Date.now();
+    
+    // Интервал очистки pending запросов (каждые 60 секунд)
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupStaleRequests();
+    }, 60000);
+  }
+
+  /**
+   * Очистка старых pending запросов
+   */
+  cleanupStaleRequests() {
+    try {
+      const removed = this.requestStore.cleanupPendingRequests(300000); // 5 минут
+      if (removed > 0) {
+        console.log(`[Metrics] Cleaned up ${removed} stale pending requests`);
+      }
+    } catch (error) {
+      console.error('[Metrics] Error during cleanup:', error);
+    }
   }
 
   /**
@@ -396,6 +443,16 @@ export class MetricsService {
     this.requestStore.clear();
     this.resetCounters();
     this.startTime = Date.now();
+  }
+
+  /**
+   * Остановка сервиса (очистка интервалов)
+   */
+  destroy() {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
   }
 }
 

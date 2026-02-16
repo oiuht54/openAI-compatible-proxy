@@ -16,8 +16,9 @@ class HeartbeatStream extends Transform {
    * @param {Object} options
    * @param {number} options.intervalMs - интервал heartbeat в миллисекундах
    * @param {string} options.heartbeatMessage - сообщение heartbeat (SSE комментарий)
+   * @param {(error?: Error) => void} options.onError - callback при ошибке
    */
-  constructor({ intervalMs, heartbeatMessage }) {
+  constructor({ intervalMs, heartbeatMessage, onError }) {
     super({ decodeStrings: false });
     this.intervalMs = intervalMs;
     this.heartbeatMessage = heartbeatMessage;
@@ -25,6 +26,7 @@ class HeartbeatStream extends Transform {
     /** @type {NodeJS.Timeout|null} */
     this.heartbeatTimer = null;
     this.ended = false;
+    this.onError = onError;
     
     this.startHeartbeat();
   }
@@ -56,17 +58,21 @@ class HeartbeatStream extends Transform {
       const timeSinceActivity = now - this.lastActivityTime;
       
       if (timeSinceActivity >= this.intervalMs) {
-        this.push(this.heartbeatMessage + '\n');
-        LoggerService.debug(`Heartbeat sent (${timeSinceActivity}ms since last data)`);
+        try {
+          this.push(this.heartbeatMessage + '\n');
+          LoggerService.debug(`Heartbeat sent (${timeSinceActivity}ms since last data)`);
+        } catch (error) {
+          if (!this.ended) {
+            this.stopHeartbeat();
+            if (this.onError) this.onError(/** @type {Error} */ (error));
+          }
+        }
       }
       
       this.heartbeatTimer = setTimeout(sendHeartbeat, this.intervalMs);
     };
     
     this.heartbeatTimer = setTimeout(sendHeartbeat, this.intervalMs);
-    
-    // Обеспечиваем очистку таймера при сборке мусора
-    this.heartbeatTimer.unref();
   }
 
   stopHeartbeat() {
@@ -75,6 +81,14 @@ class HeartbeatStream extends Transform {
       clearTimeout(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+  }
+
+  /**
+   * Принудительная остановка с очисткой
+   */
+  forceDestroy() {
+    this.stopHeartbeat();
+    this.removeAllListeners();
   }
 }
 
@@ -145,18 +159,22 @@ const circuitBreaker = new CircuitBreaker(5, 60000);
  * @param {() => Promise<any>} fn
  * @param {number} maxRetries
  * @param {number} baseDelay
+ * @param {AbortSignal} signal
  * @returns {Promise<any>}
  */
-async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000, signal) {
   let lastError;
   
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Request aborted', 'AbortError');
+    }
+    
     try {
       return await fn();
     } catch (error) {
       lastError = error;
       
-      // Не retry для клиентских ошибок (4xx) и некоторых специфических ошибок
       const err = /** @type {any} */ (error);
       if (err.response && typeof err.response.status === 'number' && 
           err.response.status >= 400 && err.response.status < 500) {
@@ -165,10 +183,15 @@ async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
       
       if (attempt < maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 500;
-        LoggerService.warn(`Request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms...`, {
-          error: err.message,
-        });
-        await new Promise(resolve => setTimeout(resolve, delay));
+        LoggerService.warn(`Request failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms...`);
+        
+        await Promise.race([
+          new Promise(resolve => setTimeout(resolve, delay)),
+          signal ? new Promise((_, reject) => {
+            const onAbort = () => reject(new DOMException('Request aborted', 'AbortError'));
+            signal.addEventListener('abort', onAbort, { once: true });
+          }) : Promise.resolve(),
+        ]);
       }
     }
   }
@@ -209,13 +232,34 @@ function filterSensitiveHeaders(headers) {
 }
 
 export class ProxyService {
-  /** @type {Map<AbortController, () => void>} */
+  /** @type {Map<AbortController, {cleanup: () => void, requestId: string}>} */
   static activeControllers = new Map();
+
+  /**
+   * @param {AbortController} controller
+   * @param {() => void} cleanup
+   * @param {string} requestId
+   */
+  static registerController(controller, cleanup, requestId) {
+    this.activeControllers.set(controller, { cleanup, requestId });
+  }
+
+  /**
+   * @param {AbortController} controller
+   */
+  static unregisterController(controller) {
+    this.activeControllers.delete(controller);
+  }
 
   static cancelAllRequests() {
     LoggerService.warn(`Force killing ${this.activeControllers.size} active requests...`);
-    for (const [controller] of this.activeControllers) {
-      controller.abort('Server Shutdown');
+    for (const [controller, { cleanup }] of this.activeControllers) {
+      try {
+        controller.abort('Server Shutdown');
+        cleanup();
+      } catch (err) {
+        LoggerService.error('Error during request cleanup on shutdown', null);
+      }
     }
     this.activeControllers.clear();
   }
@@ -230,18 +274,21 @@ export class ProxyService {
 
   constructor() {
     this.client = axios.create({
-      timeout: 0,
+      timeout: 60000,
+      maxRedirects: 5,
       httpAgent: new http.Agent({
         keepAlive: true,
-        maxSockets: 50,
-        maxFreeSockets: 10,
-        timeout: 30000,
+        keepAliveMsecs: 1000,
+        maxSockets: 100,
+        maxFreeSockets: 50,
+        timeout: 60000,
       }),
       httpsAgent: new https.Agent({
         keepAlive: true,
-        maxSockets: 50,
-        maxFreeSockets: 10,
-        timeout: 30000,
+        keepAliveMsecs: 1000,
+        maxSockets: 100,
+        maxFreeSockets: 50,
+        timeout: 60000,
         rejectUnauthorized: true,
       }),
       validateStatus: () => true,
@@ -271,7 +318,6 @@ export class ProxyService {
     firstTokenRetryAttempts,
     requestId,
   }) {
-    /** @type {Error} */
     let lastError = new FirstTokenTimeoutError('First token timeout', 0);
 
     for (let attempt = 0; attempt <= firstTokenRetryAttempts; attempt++) {
@@ -280,19 +326,31 @@ export class ProxyService {
       /** @type {NodeJS.Timeout|null} */
       let firstTokenTimeoutId = null;
       const attemptStartTime = Date.now();
+      
+      /** @type {PassThrough | null} */
+      let bufferedStream = null;
+      /** @type {Buffer[]} */
+      let savedChunks = [];
+      /** @type {((chunk: Buffer) => void) | null} */
+      let checkForFirstToken = null;
+      /** @type {import('stream').Readable | null} */
+      let originalResponseData = null;
 
       try {
-        // Создаем PassThrough поток для сбора данных до получения первого токена
-        const bufferedStream = new PassThrough();
-        /** @type {Buffer[]} */
-        const savedChunks = [];
+        if (attempt > 0 && abortController.signal.aborted) {
+          throw new DOMException('Request aborted', 'AbortError');
+        }
+
+        bufferedStream = new PassThrough({
+          autoDestroy: true,
+        });
+        savedChunks = [];
         
-        // СОЗДАЕМ ТАЙМЕР ДО отправки запроса!
-        /** @type {((value: null) => void) | null} */
-        let firstTokenResolve = null;
+        /** @type {(value: null) => void} */
+        let firstTokenResolve = () => {};
         
         const firstTokenPromise = new Promise((resolve) => {
-          firstTokenResolve = resolve;
+          firstTokenResolve = /** @type {(value: null) => void} */ (resolve);
           
           firstTokenTimeoutId = setTimeout(() => {
             const elapsed = Date.now() - attemptStartTime;
@@ -304,17 +362,14 @@ export class ProxyService {
                 elapsed,
                 timeout: firstTokenTimeoutMs,
               });
-              // Прерываем запрос через abort signal - это вызовет ошибку в circuitBreaker.execute
               attemptController.abort('First Token Timeout');
-              // Разрешаем promise (не reject, чтобы не было unhandled rejection)
               resolve(null);
             }
           }, firstTokenTimeoutMs);
         });
         
-        // Теперь отправляем запрос с уже запущенным таймером
         const response = await circuitBreaker.execute(async () => {
-          const axiosPromise = this.client({
+          return await this.client({
             method: method,
             url: targetUrl,
             headers: forwardHeaders,
@@ -322,9 +377,6 @@ export class ProxyService {
             responseType: 'stream',
             signal: attemptController.signal,
           });
-          
-          const result = await axiosPromise;
-          return result;
         });
 
         if (!response.data || typeof response.data.pipe !== 'function') {
@@ -332,9 +384,9 @@ export class ProxyService {
           return response;
         }
 
-        // Устанавливаем обработчик для поиска первого токена в потоке
-        const checkForFirstToken = (/** @type {Buffer} */ chunk) => {
-          // Сохраняем чанк для последующей передачи
+        originalResponseData = response.data;
+
+        checkForFirstToken = (/** @type {Buffer} */ chunk) => {
           savedChunks.push(chunk);
           
           const lines = chunk.toString().split('\n');
@@ -358,64 +410,120 @@ export class ProxyService {
                     timeout: firstTokenTimeoutMs,
                   });
                   
-                  // Удаляем обработчик после нахождения первого токена
-                  response.data.off('data', checkForFirstToken);
-                  // Передаем все сохраненные чанки в bufferedStream
-                  savedChunks.forEach(c => bufferedStream.write(c));
-                  // Разрешаем promise первого токена
+                  if (checkForFirstToken) {
+                    response.data.off('data', checkForFirstToken);
+                  }
+                  savedChunks.forEach((c) => {
+                    try {
+                      if (bufferedStream) bufferedStream.write(c);
+                    } catch (err) {
+                    }
+                  });
                   if (firstTokenResolve) firstTokenResolve(null);
                   return;
                 }
               } catch (e) {
-                // Ignore JSON parse errors for invalid SSE lines
               }
             }
           }
         };
 
         response.data.on('data', checkForFirstToken);
+        
         response.data.once('end', () => {
-          // Передаем все сохраненные чанки если поток закончился
-          savedChunks.forEach(c => bufferedStream.write(c));
-          bufferedStream.end();
-             
-            // Удаляем обработчик при завершении потока
-            response.data.off('data', checkForFirstToken);
-            if (!firstTokenReceived && firstTokenTimeoutId) {
-              clearTimeout(firstTokenTimeoutId);
+          savedChunks.forEach((c) => {
+            try {
+              if (bufferedStream) bufferedStream.write(c);
+            } catch (err) {
             }
           });
-          response.data.once('error', (/** @type {Error} */ err) => {
-            // Удаляем обработчик при ошибке
+          try {
+            if (bufferedStream) bufferedStream.end();
+          } catch (err) {
+          }
+             
+          if (checkForFirstToken) {
             response.data.off('data', checkForFirstToken);
-            if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
-          });
+          }
+          if (!firstTokenReceived && firstTokenTimeoutId) {
+            clearTimeout(firstTokenTimeoutId);
+          }
+        });
         
-        // Ждем получения первого токена или истечения таймера
+        response.data.once('error', (/** @type {Error} */ err) => {
+          if (checkForFirstToken) {
+            response.data.off('data', checkForFirstToken);
+          }
+          if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
+          try {
+            if (bufferedStream) bufferedStream.destroy(err);
+          } catch (e) {
+          }
+        });
+        
+        response.data.once('close', () => {
+          if (checkForFirstToken) {
+            response.data.off('data', checkForFirstToken);
+          }
+          if (!firstTokenReceived && firstTokenTimeoutId) {
+            clearTimeout(firstTokenTimeoutId);
+          }
+        });
+        
         await firstTokenPromise;
         
-        // Заменяем response.data на bufferedStream для дальнейшей передачи
-        const originalResponseData = response.data;
         response.data = bufferedStream;
-        originalResponseData.pipe(bufferedStream);
+        
+        if (originalResponseData) {
+          originalResponseData.pipe(bufferedStream, { end: true });
+        }
         
         return response;
 
-      } catch (/** @type {unknown} */ error) {
-        if (firstTokenTimeoutId) clearTimeout(firstTokenTimeoutId);
+      } catch (error) {
+        if (firstTokenTimeoutId) {
+          clearTimeout(firstTokenTimeoutId);
+        }
 
-        /** @type {{code?: string, message?: string} | null} */
+        // Удаляем обработчик событий
+        if (originalResponseData && checkForFirstToken) {
+          originalResponseData.off('data', checkForFirstToken);
+        }
+
+        // Уничтожаем bufferedStream если был создан
+        if (bufferedStream) {
+          try {
+            bufferedStream.destroy();
+          } catch (err) {
+          }
+        }
+
+        // Уничтожаем исходный поток от upstream при ошибке или abort
+        if (originalResponseData) {
+          try {
+            originalResponseData.destroy();
+          } catch (err) {
+            // Игнорируем ошибки при уничтожении уже закрытого потока
+          }
+        }
+
+        /** @type {any} */
         const err = error && typeof error === 'object' ? error : null;
 
-        // Проверяем, была ли ошибка из-за aborted запроса (таймаут первого токена)
         const isAbortedError = err && (
           err.code === 'ERR_CANCELED' ||
           err.code === 'ECONNABORTED' ||
           err.message?.includes('canceled') ||
-          err.message?.includes('aborted')
+          err.message?.includes('aborted') ||
+          error instanceof DOMException && error.name === 'AbortError'
         );
 
-        // Если это aborted ошибка и таймер сработал, создаем FirstTokenTimeoutError для retry
+        const isMainControllerAborted = abortController.signal.aborted;
+
+        if (isMainControllerAborted) {
+          throw new DOMException('Request aborted', 'AbortError');
+        }
+
         if (isAbortedError) {
           const timeoutError = new FirstTokenTimeoutError(`No tokens received within ${firstTokenTimeoutMs}ms`, attempt);
           
@@ -423,7 +531,6 @@ export class ProxyService {
             requestId,
             attempt: attempt + 1,
             message: timeoutError.message,
-            originalError: err?.message || err?.code,
           });
           
           lastError = timeoutError;
@@ -435,7 +542,6 @@ export class ProxyService {
           continue;
         }
 
-        // Обработка FirstTokenTimeoutError от других источников
         if (error instanceof FirstTokenTimeoutError) {
           LoggerService.warn(`[FirstTokenTimeout] First token timeout occurred (attempt ${attempt + 1}/${firstTokenRetryAttempts + 1}). Retrying...`, {
             requestId,
@@ -478,25 +584,15 @@ export class ProxyService {
 
     const abortController = new AbortController();
     let cleanedUp = false;
+    /** @type {NodeJS.Timeout | null} */
+    let streamFallbackTimeoutId = null;
     
-    // Флаги для отслеживания активных обработчиков
+    /** @type {Array<{emitter: import('events').EventEmitter, event: string, handler: (...args: any[]) => void}>} */
     /** @type {Array<{emitter: import('events').EventEmitter, event: string, handler: (...args: any[]) => void}>} */
     const eventHandlers = [];
 
-    // Функция для безопасной очистки ресурсов
-    const cleanup = () => {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      
-      clearTimeout(timeoutId);
-      ProxyService.activeControllers.delete(abortController);
-      
-      // Удаляем все зарегистрированные обработчики событий
-      eventHandlers.forEach(({ emitter, event, handler }) => {
-        emitter.off(event, handler);
-      });
-      eventHandlers.length = 0;
-    };
+    /** @type {Array<{stream: any, destroy: boolean}>} */
+    const streamsToDestroy = [];
 
     /**
      * @param {import('events').EventEmitter} emitter
@@ -508,13 +604,66 @@ export class ProxyService {
       emitter.on(event, handler);
     };
 
-    ProxyService.activeControllers.set(abortController, cleanup);
+    /**
+     * @param {any} stream
+     * @param {boolean} destroy
+     */
+    const registerStream = (stream, destroy = true) => {
+      streamsToDestroy.push({ stream, destroy });
+    };
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      
+      LoggerService.debug('[Cleanup] Starting cleanup for request');
+      
+      if (streamFallbackTimeoutId) {
+        clearTimeout(streamFallbackTimeoutId);
+        streamFallbackTimeoutId = null;
+      }
+      
+      eventHandlers.forEach(({ emitter, event, handler }) => {
+        try {
+          emitter.off(event, handler);
+        } catch (err) {
+        }
+      });
+      eventHandlers.length = 0;
+      
+      streamsToDestroy.forEach(({ stream, destroy }) => {
+        try {
+          if (destroy) {
+            stream.destroy();
+          } else {
+            stream.end();
+          }
+        } catch (err) {
+        }
+      });
+      streamsToDestroy.length = 0;
+      
+      ProxyService.unregisterController(abortController);
+      
+      LoggerService.debug('[Cleanup] Cleanup completed');
+    };
+
+    const requestId = metricsService.startRequest(method, endpoint, headers, body);
+    ProxyService.registerController(abortController, cleanup, requestId);
 
     const timeoutId = setTimeout(() => {
-      LoggerService.warn(`Request timed out after ${currentTimeoutMs}ms. Aborting...`);
+      LoggerService.warn(`Request timed out after ${currentTimeoutMs}ms. Aborting...`, { requestId });
       abortController.abort('Request Timeout');
-      cleanup();
     }, currentTimeoutMs);
+
+    const timeoutCleanup = () => {
+      clearTimeout(timeoutId);
+    };
+    eventHandlers.push({
+      emitter: /** @type {any} */ (null),
+      event: 'timeout',
+      handler: timeoutCleanup,
+    });
 
     const baseUrl = upstreamConfig.url.replace(/\/$/, "");
     const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
@@ -522,7 +671,6 @@ export class ProxyService {
     
     const forwardHeaders = { ...headers };
     
-    // Удаляем заголовки которые нужно фильтровать
     delete forwardHeaders['host'];
     delete forwardHeaders['content-length'];
     delete forwardHeaders['connection'];
@@ -532,7 +680,6 @@ export class ProxyService {
       forwardHeaders['authorization'] = `Bearer ${upstreamConfig.apiKey}`;
     }
 
-    // Логируем с фильтрованными заголовками
     LoggerService.logTraffic('req', `${method} ${targetUrl}`, {
       headers: filterSensitiveHeaders(forwardHeaders),
       body: body,
@@ -542,21 +689,15 @@ export class ProxyService {
     const requestStartTime = Date.now();
     const firstTokenTimeoutMs = upstreamConfig.firstTokenTimeoutMs || 20000;
     const firstTokenRetryAttempts = upstreamConfig.firstTokenRetryAttempts || 2;
+    const streamFallbackTimeoutMs = /** @type {number} */ (upstreamConfig.streamFallbackTimeoutMs) || currentTimeoutMs;
 
-    // Регистрация начала запроса в метриках
-    const requestId = metricsService.startRequest(method, targetUrl, forwardHeaders, body);
-    
     LoggerService.debug(`[Proxy] Stream detection`, {
       requestId,
       isStreaming,
       streamValue: body?.stream,
-      bodyHasStream: 'stream' in (body || {}),
-      bodyKeys: body ? Object.keys(body) : 'body is null/undefined',
     });
 
     try {
-      // Выполняем запрос через circuit breaker и с retry
-      // Для стриминговых запросов используем специальную логику с first-token timeout
       const response = isStreaming
         ? await this.executeStreamingWithFirstTokenRetry({
             method,
@@ -579,15 +720,21 @@ export class ProxyService {
                 signal: abortController.signal,
               });
             });
-          }, 3, 1000);
+          }, 3, 1000, abortController.signal);
+
+      if (abortController.signal.aborted) {
+        throw new DOMException('Request aborted', 'AbortError');
+      }
 
       res.status(response.status);
 
-      // Пересылаем заголовки от upstream
       Object.entries(response.headers).forEach(([key, value]) => {
         const lowerKey = key.toLowerCase();
         if (!['transfer-encoding', 'connection', 'content-length', 'content-encoding'].includes(lowerKey)) {
-          res.setHeader(key, value);
+          try {
+            res.setHeader(key, value);
+          } catch (err) {
+          }
         }
       });
 
@@ -595,21 +742,42 @@ export class ProxyService {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
 
-        LoggerService.info('Stream connection established.');
+        LoggerService.info('Stream connection established.', { requestId });
 
-        const spyStream = new PassThrough();
+        const spyStream = new PassThrough({
+          autoDestroy: true,
+        });
+        registerStream(spyStream, false);
+        
         let accumulatedText = '';
         let accumulatedThinking = '';
+        let streamCompleted = false;
 
-        // Регистрируем обработчик для накопления данных
-        registerHandler(spyStream, 'data', (chunk) => {
+        if (streamFallbackTimeoutMs > 0) {
+          streamFallbackTimeoutId = setTimeout(() => {
+            if (!streamCompleted && !cleanedUp) {
+              LoggerService.warn(`[StreamFallback] Stream timeout after ${streamFallbackTimeoutMs}ms. Force closing.`, { requestId });
+              try {
+                spyStream.end();
+              } catch (err) {
+              }
+              cleanup();
+            }
+          }, streamFallbackTimeoutMs);
+        }
+
+        registerHandler(spyStream, 'data', (/** @type {Buffer} */ chunk) => {
           const lines = chunk.toString().split('\n');
           for (const line of lines) {
             if (line.trim().startsWith('data: ')) {
               try {
                 const jsonStr = line.trim().substring(6);
-                if (jsonStr === '[DONE]') continue;
+                if (jsonStr === '[DONE]') {
+                  streamCompleted = true;
+                  continue;
+                }
                  
                 const data = JSON.parse(jsonStr);
                 const delta = data.choices?.[0]?.delta;
@@ -628,72 +796,115 @@ export class ProxyService {
           }
         });
 
-        // Обработчик завершения потока
         registerHandler(spyStream, 'end', () => {
+          streamCompleted = true;
+          if (streamFallbackTimeoutId) {
+            clearTimeout(streamFallbackTimeoutId);
+            streamFallbackTimeoutId = null;
+          }
+          
           const duration = Date.now() - requestStartTime;
           cleanup();
+          
           LoggerService.logTraffic('res', 'STREAM FINISHED', {
+            requestId,
             thoughts: accumulatedThinking || undefined,
             response: accumulatedText,
           });
-          // Регистрация успешного запроса в метриках
+          
           metricsService.finishRequestSuccess(requestId, response?.status || 200, {
             thoughts: accumulatedThinking || undefined,
             response: accumulatedText,
           }, duration);
         });
 
-        // Обработчик ошибок в потоке данных
-        registerHandler(spyStream, 'error', (err) => {
-          LoggerService.error('SpyStream error', err);
+        registerHandler(spyStream, 'error', (/** @type {Error} */ err) => {
+          LoggerService.error('SpyStream error', null);
           cleanup();
+          
+          const duration = Date.now() - requestStartTime;
+          metricsService.finishRequestError(requestId, err, duration, 'spy_stream_error');
         });
 
-        // Обработчик закрытия соединения клиентом
+        registerHandler(spyStream, 'close', () => {
+          if (!streamCompleted && !cleanedUp) {
+            LoggerService.warn('SpyStream closed unexpectedly', { requestId });
+            cleanup();
+            
+            const duration = Date.now() - requestStartTime;
+            if (duration > 0) {
+              metricsService.finishRequestError(requestId, new Error('Stream closed unexpectedly'), duration, 'stream_unexpected_close');
+            }
+          }
+        });
+
         registerHandler(res, 'close', () => {
-          if (!res.writableEnded) {
-            LoggerService.warn('Client closed connection. Destroying upstream stream.');
+          if (!res.writableEnded && !cleanedUp) {
+            LoggerService.warn('Client closed connection. Destroying upstream stream.', { requestId });
             abortController.abort('Client Disconnect');
-            // Регистрация ошибки метрик при дисконнекте клиента
+            
             const duration = Date.now() - requestStartTime;
             metricsService.finishRequestError(requestId, new Error('Client disconnected'), duration, 'client_disconnect');
+            cleanup();
           }
-          cleanup();
         });
 
-        // Обработчик ошибок в upstream потоке
-        registerHandler(response.data, 'error', (err) => {
-          LoggerService.error('Upstream stream error', err);
+        registerHandler(res, 'finish', () => {
+          LoggerService.debug('Response finish event', { requestId });
+        });
+
+        registerHandler(response.data, 'error', (/** @type {Error} */ err) => {
+          LoggerService.error('Upstream stream error', null);
           const duration = Date.now() - requestStartTime;
           metricsService.finishRequestError(requestId, err, duration, 'upstream_stream_error');
           cleanup();
         });
 
-        // Подключаем heartbeat если включен
+        registerHandler(response.data, 'end', () => {
+          LoggerService.debug('Upstream stream ended', { requestId });
+        });
+
+        registerHandler(response.data, 'close', () => {
+          LoggerService.debug('Upstream stream closed', { requestId });
+        });
+
         if (currentConfig.upstream.streamHeartbeatEnabled) {
           const heartbeatStream = new HeartbeatStream({
             intervalMs: currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000,
             heartbeatMessage: currentConfig.upstream.streamHeartbeatMessage ?? ':keep-alive',
+            onError: (err) => {
+              LoggerService.error('HeartbeatStream error', null);
+              cleanup();
+            }
           });
+          registerStream(heartbeatStream);
           
-          registerHandler(heartbeatStream, 'error', (err) => {
-            LoggerService.error('HeartbeatStream error', err);
-            cleanup();
-          });
+          LoggerService.info(`Heartbeat enabled (${currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000}ms interval)`, { requestId });
           
-          LoggerService.info(`Heartbeat enabled (${currentConfig.upstream.streamHeartbeatIntervalMs ?? 30000}ms interval)`);
-          response.data.pipe(heartbeatStream).pipe(spyStream).pipe(res);
+          response.data
+            .pipe(heartbeatStream)
+            .pipe(spyStream)
+            .pipe(res)
+            .on('error', (/** @type {Error} */ err) => {
+              LoggerService.error('Pipeline error', null);
+              cleanup();
+            });
         } else {
-          response.data.pipe(spyStream).pipe(res);
+          response.data
+            .pipe(spyStream)
+            .pipe(res)
+            .on('error', (/** @type {Error} */ err) => {
+              LoggerService.error('Pipeline error', null);
+              cleanup();
+            });
         }
 
       } else {
-        // Обработка не-стриминговых ответов
         const jsonData = response.data;
         cleanup();
+        
         const duration = Date.now() - requestStartTime;
         
-        // Регистрация в метриках
         if (response.status >= 400) {
           LoggerService.logTraffic('res', `ERROR RESPONSE (${response.status})`, {
             status: response.status,
@@ -705,50 +916,50 @@ export class ProxyService {
           metricsService.finishRequestSuccess(requestId, response.status, jsonData, duration);
         }
         
-        res.json(jsonData);
+        if (!res.headersSent) {
+          res.json(jsonData);
+        }
       }
 
     } catch (error) {
       const duration = Date.now() - requestStartTime;
+      
+      const headersAlreadySent = res.headersSent;
       cleanup();
 
-      /** @type {Error} */
       const typedError = error instanceof Error ? error : new Error(String(error));
 
-      // Handle FirstTokenTimeoutError - all retries exhausted
       if (typedError instanceof FirstTokenTimeoutError) {
-        LoggerService.error(`First token timeout after all retries: ${typedError.message}`);
+        LoggerService.error(`First token timeout after all retries: ${typedError.message}`, null);
         metricsService.finishRequestError(requestId, typedError, duration, 'first_token_timeout_exhausted');
         
-        const firstTokenTimeoutResponse = {
-          error: {
-            message: 'No tokens received from upstream model within the timeout period after multiple retries',
-            type: 'first_token_timeout',
-            code: 504,
-          }
-        };
-        
-        if (!res.headersSent) {
+        if (!headersAlreadySent) {
+          const firstTokenTimeoutResponse = {
+            error: {
+              message: 'No tokens received from upstream model within the timeout period after multiple retries',
+              type: 'first_token_timeout',
+              code: 504,
+            }
+          };
           res.status(504).json(firstTokenTimeoutResponse);
         }
         return;
       }
 
-      if (axios.isCancel(typedError) || typedError?.name === 'AbortError' || typedError?.message === 'Request Timeout') {
-        LoggerService.error(`Request aborted: ${typedError.message || 'Timeout'}`);
+      if (typedError.name === 'AbortError' || axios.isCancel(typedError) || typedError?.message === 'Request Timeout') {
+        LoggerService.error(`Request aborted: ${typedError.message || 'Timeout'}`, null);
         metricsService.finishRequestError(requestId, typedError, duration, 'timeout');
         
-        const timeoutResponse = {
-          error: {
-            message: typedError.message === 'Request Timeout' 
-              ? 'Request timed out waiting for upstream model'
-              : typedError.message,
-            type: typedError.message === 'Request Timeout' ? 'timeout_error' : 'request_aborted',
-            code: 504,
-          }
-        };
-        
-        if (!res.headersSent) {
+        if (!headersAlreadySent) {
+          const timeoutResponse = {
+            error: {
+              message: typedError.message === 'Request Timeout' 
+                ? 'Request timed out waiting for upstream model'
+                : typedError.message,
+              type: typedError.message === 'Request Timeout' ? 'timeout_error' : 'request_aborted',
+              code: 504,
+            }
+          };
           res.status(504).json(timeoutResponse);
         }
         return;
@@ -758,32 +969,30 @@ export class ProxyService {
         LoggerService.error('Circuit Breaker blocked request', null);
         metricsService.finishRequestError(requestId, typedError, duration, 'circuit_breaker');
         
-        const cbResponse = {
-          error: {
-            message: 'Service temporarily unavailable due to repeated failures',
-            type: 'service_unavailable',
-            code: 503,
-          }
-        };
-        
-        if (!res.headersSent) {
+        if (!headersAlreadySent) {
+          const cbResponse = {
+            error: {
+              message: 'Service temporarily unavailable due to repeated failures',
+              type: 'service_unavailable',
+              code: 503,
+            }
+          };
           res.status(503).json(cbResponse);
         }
         return;
       }
 
-      LoggerService.error('Fatal proxy error', null);
+      LoggerService.error(`Fatal proxy error: ${typedError.message}`, null);
       metricsService.finishRequestError(requestId, typedError, duration, 'proxy_error');
       
-      const errorResponse = {
-        error: {
-          message: 'Bad Gateway: Proxy connection failed',
-          type: 'proxy_error',
-          details: typedError.message,
-        }
-      };
-
-      if (!res.headersSent) {
+      if (!headersAlreadySent) {
+        const errorResponse = {
+          error: {
+            message: 'Bad Gateway: Proxy connection failed',
+            type: 'proxy_error',
+            details: typedError.message,
+          }
+        };
         res.status(502).json(errorResponse);
       }
     }

@@ -5,9 +5,10 @@
   },
   "upstream": {
     "url": "http://your-llm-server:8000/v1",
-    "timeoutMs": 180000,
-    "firstTokenTimeoutMs": 20000,
+    "timeoutMs": 3600000,
+    "firstTokenTimeoutMs": 60000,
     "firstTokenRetryAttempts": 2,
+    "streamFallbackTimeoutMs": 3600000,
     "apiKey": "sk-your-upstream-api-key",
     "streamHeartbeatEnabled": true,
     "streamHeartbeatIntervalMs": 30000,

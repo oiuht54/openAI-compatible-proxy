@@ -23,8 +23,10 @@ async function startServer() {
             LoggerService.info('Hot Reload is ACTIVE: Just save config.json to apply changes.');
         });
 
-        server.keepAliveTimeout = 120 * 1000;
-        server.headersTimeout = 125 * 1000;
+        // Оптимизированные таймауты для стриминговых запросов с очень медленными моделями
+        server.keepAliveTimeout = 7200000; // 2 часа для long-lived стриминговых соединений
+        server.headersTimeout = 7205000;   // 5 секунд больше keepAliveTimeout
+        server.requestTimeout = 3600000;   // 60 минут для очень медленных запросов
 
         const shutdown = () => {
             LoggerService.info('\n🛑 Received kill signal. Shutting down...');

@@ -15,10 +15,11 @@ const ConfigSchema = z.object({
     }),
     upstream: z.object({
       url: z.string().url(),
-      timeoutMs: z.number().positive().default(60000),
+      timeoutMs: z.number().positive().default(3600000), // 60 минут для очень медленных моделей
       apiKey: z.string().optional(),
-      firstTokenTimeoutMs: z.number().positive().default(20000),
+      firstTokenTimeoutMs: z.number().positive().default(60000), // 60 секунд для первого токена
       firstTokenRetryAttempts: z.number().nonnegative().default(2),
+      streamFallbackTimeoutMs: z.number().positive().default(3600000), // 60 минут для стриминга
       streamHeartbeatEnabled: z.boolean().default(true),
       streamHeartbeatIntervalMs: z.number().positive().default(30000),
       streamHeartbeatMessage: z.string().default(':keep-alive'),
